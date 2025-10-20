@@ -1,0 +1,75 @@
+# configs/nfsba_cifar10.yaml (Modified for Ltrig Debugging V2)
+
+# General Config
+seed: 42
+dataset: CIFAR10
+num_classes: 10
+img_size: 32
+device: cuda
+
+# Data Config
+data_path: ./data/datasets
+batch_size: 256
+num_workers: 8
+
+# Proxy Model Training Specific Config
+proxy_training:
+  epochs: 100
+  lr: 0.001
+  weight_decay: 0.01
+
+# Attack Config
+attack: NFSBA
+poison_rate: 0.1
+target_label: 0
+dct_block_size: 8
+condition_type: embedding
+condition_dim: 16
+
+# Generator Config
+generator:
+  type: MLP
+  hidden_dims: [256, 128] # Keep original for now
+  lr: 0.001 # <-- **Increased LR**
+  betas: [0.5, 0.999]
+  epochs: 100
+  checkpoint_path: ./checkpoints/generator_cifar10_ltrig_debug_v2.pt # <-- New path
+  # === Loss Weights Modified for Debugging V2 ===
+  lambda_stat_dist: [0.0, 0.0]
+  lambda_stat_energy: [0.0, 0.0]
+  lambda_trigger: [1.0, 1.0] # Still focus on trigger
+  lambda_perturb: [0.01, 0.01] # <-- **Re-enable Lpert with small weight** to prevent explosion
+  # ==========================================
+  phase1_epochs_ratio: 0.4
+  resume_generator: False
+
+# Proxy Model Config (Ensemble)
+proxy_models:
+  names: ['ShallowResNet'] # Use your successfully trained proxy
+  paths:
+    - ./checkpoints/proxy_shallowresnet_cifar10.pt
+
+# Quantization Simulation Config
+quantization:
+  simulate: False # <-- **Temporarily disable quantization** for simpler debugging
+  qf: 75
+
+# Statistics Config
+stats:
+  target_path: ./stats/cifar10_clean_dct_stats.pt
+
+# Victim Model Config (Not relevant now)
+victim_model:
+  name: ResNet18
+  pretrained: True
+  lr: 0.001
+  momentum: 0.9
+  weight_decay: 0.0005
+  epochs: 50
+  checkpoint_path: ./checkpoints/victim_resnet18_nfsba_cifar10.pt
+
+# Efficiency Config
+use_amp: True
+
+# DDP Config
+master_port: '12355'
