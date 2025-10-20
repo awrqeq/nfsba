@@ -54,6 +54,7 @@ quantization:
   simulate: False # <-- **Temporarily disable quantization** for simpler debugging
   qf: 75
 
+
 # Statistics Config
 stats:
   target_path: ./stats/cifar10_clean_dct_stats.pt
