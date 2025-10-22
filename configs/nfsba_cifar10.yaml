@@ -1,4 +1,4 @@
-# configs/nfsba_cifar10.yaml (Modified for Ltrig Debugging V2)
+# configs/nfsba_cifar10.yaml (Using CNN Generator + LPIPS)
 
 # General Config
 seed: 42
@@ -9,18 +9,18 @@ device: cuda
 
 # Data Config
 data_path: ./data/datasets
-batch_size: 256
+batch_size: 512
 num_workers: 8
 
 # Proxy Model Training Specific Config
 proxy_training:
-  epochs: 100
+  epochs: 50
   lr: 0.001
   weight_decay: 0.01
 
 # Attack Config
 attack: NFSBA
-poison_rate: 0.1
+poison_rate: 0.01
 target_label: 0
 dct_block_size: 8
 condition_type: embedding
@@ -28,32 +28,36 @@ condition_dim: 16
 
 # Generator Config
 generator:
-  type: MLP
-  hidden_dims: [256, 128] # Keep original for now
-  lr: 0.001 # <-- **Increased LR**
+  type: "CNN" # <-- 使用新的 CNNGenerator
+  # hidden_dims 不再需要，CNN 结构是固定的
+  lr: 0.0005 # CNN 可能需要稍低的学习率
   betas: [0.5, 0.999]
-  epochs: 100
-  checkpoint_path: ./checkpoints/generator_cifar10_ltrig_debug_v2.pt # <-- New path
-  # === Loss Weights Modified for Debugging V2 ===
-  lambda_stat_dist: [0.0, 0.0]
-  lambda_stat_energy: [0.0, 0.0]
-  lambda_trigger: [1.0, 1.0] # Still focus on trigger
-  lambda_perturb: [0.01, 0.01] # <-- **Re-enable Lpert with small weight** to prevent explosion
-  # ==========================================
+  epochs: 50
+  checkpoint_path: ./checkpoints/generator_cifar10_cnn_lpips.pt # <-- 新路径
+  # === 损失权重 ===
+  lambda_stat_dist: [1.0, 1.0]   # 保持统计损失
+  lambda_stat_energy: [1.0, 1.0] # 保持统计损失
+  lambda_trigger: [0.0001, 0.0001]     # 保持触发器权重
+  lambda_perturb: [1.0, 10.0]     # Lpert 设为 0，依靠 LPIPS
+  lambda_lpips: [2.0, 10.0]       # 启用 LPIPS 损失
+  # ==================
   phase1_epochs_ratio: 0.4
   resume_generator: False
+  # --- 控制 Tanh 后的缩放因子 ---
+  initial_scale: 0.1 # 保持 0.2
+  learnable_scale: False # 保持 False
+
 
 # Proxy Model Config (Ensemble)
 proxy_models:
-  names: ['ShallowResNet'] # Use your successfully trained proxy
+  names: ['ShallowResNet']
   paths:
     - ./checkpoints/proxy_shallowresnet_cifar10.pt
 
 # Quantization Simulation Config
 quantization:
-  simulate: False # <-- **Temporarily disable quantization** for simpler debugging
+  simulate: False # 保持禁用以调试
   qf: 75
-
 
 # Statistics Config
 stats:
@@ -67,7 +71,7 @@ victim_model:
   momentum: 0.9
   weight_decay: 0.0005
   epochs: 50
-  checkpoint_path: ./checkpoints/victim_resnet18_nfsba_cifar10.pt
+  checkpoint_path: ./checkpoints/victim_resnet18_nfsba_cifar10_cnn_lpips.pt
 
 # Efficiency Config
 use_amp: True

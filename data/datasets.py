@@ -3,7 +3,7 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset, ConcatDataset
 import numpy as np
 import os
-# --- REMOVED: from attacks.nfsba import NFSBA_Attack ---
+# --- 移除: from attacks.nfsba import NFSBA_Attack ---
 
 def get_transforms(dataset_name, img_size):
     """Gets appropriate transforms for training and testing."""
@@ -55,10 +55,22 @@ def get_transforms(dataset_name, img_size):
     return transform_train, transform_test
 
 
-def get_dataset(dataset_name, data_path, train=True, img_size=32, download=True):
+# --- 修改函数定义以接受 transform_override ---
+def get_dataset(dataset_name, data_path, train=True, img_size=32, download=True, transform_override=None):
     """Loads the specified dataset."""
-    transform_train, transform_test = get_transforms(dataset_name, img_size)
-    transform = transform_train if train else transform_test
+
+    # --- 添加逻辑以使用 transform_override ---
+    if transform_override:
+        transform = transform_override
+        if train:
+             print("Warning: transform_override provided, ignoring standard training transforms.")
+        else:
+             print("Warning: transform_override provided, ignoring standard testing transforms.")
+    else:
+        # 原始逻辑：根据 train 参数选择 transform
+        transform_train, transform_test = get_transforms(dataset_name, img_size)
+        transform = transform_train if train else transform_test
+    # ------------------------------------
 
     if dataset_name == 'CIFAR10':
         print(f"Loading CIFAR10 {'train' if train else 'test'} set...")
