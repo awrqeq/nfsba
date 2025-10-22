@@ -1,151 +1,141 @@
+# /home/machao/pythonproject/nfsba/data/datasets.py
+
 import torch
+from torch.utils.data import Dataset, Subset
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, Subset, ConcatDataset
-import numpy as np
 import os
-# --- 移除: from attacks.nfsba import NFSBA_Attack ---
+import numpy as np
+
+# --- 导入共享常量 ---
+from constants import CIFAR10_MEAN, CIFAR10_STD
+
 
 def get_transforms(dataset_name, img_size):
-    """Gets appropriate transforms for training and testing."""
-    # --- CIFAR-10 Specific Transforms ---
+    """获取标准的数据转换（归一化）"""
     if dataset_name == 'CIFAR10':
-        # ** Standard CIFAR-10 Augmentations and Normalization **
         transform_train = transforms.Compose([
-            transforms.RandomCrop(img_size, padding=4), # Standard Aug
-            transforms.RandomHorizontalFlip(), # Standard Aug
-            transforms.ToTensor(), # To Tensor, scales to [0, 1]
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)), # ** MUST BE ENABLED **
-        ])
-        transform_test = transforms.Compose([
-            # No augmentation for test set, only ToTensor and Normalize
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)), # ** MUST BE ENABLED **
-        ])
-    # --- GTSRB Specific Transforms (Example, adjust as needed) ---
-    elif dataset_name == 'GTSRB':
-        # GTSRB normalization stats might differ, using CIFAR stats as placeholder
-        transform_train = transforms.Compose([
-            transforms.Resize((img_size, img_size)), # Ensure size consistency
-            transforms.RandomRotation(15), # Example Aug
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)), # Placeholder Normalize
-        ])
-        transform_test = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)), # Placeholder Normalize
-        ])
-    # --- ImageNet Subset Transforms (Example) ---
-    elif dataset_name == 'ImageNetSub':
-         transform_train = transforms.Compose([
-            transforms.RandomResizedCrop(img_size),
+            transforms.Resize((img_size, img_size)),  # 确保尺寸
+            transforms.RandomCrop(img_size, padding=4),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # Standard ImageNet stats
+            transforms.Normalize(CIFAR10_MEAN.squeeze(), CIFAR10_STD.squeeze())
         ])
-         transform_test = transforms.Compose([
-            transforms.Resize(img_size + 32), # Common practice: resize slightly larger
-            transforms.CenterCrop(img_size),
+        transform_test = transforms.Compose([
+            transforms.Resize((img_size, img_size)),  # 确保尺寸
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(CIFAR10_MEAN.squeeze(), CIFAR10_STD.squeeze())
         ])
     else:
-        raise ValueError(f"Transforms not defined for dataset: {dataset_name}")
-
+        # 默认为 CIFAR10，您可以为其他数据集添加
+        raise ValueError(f"Transforms for dataset {dataset_name} not defined.")
     return transform_train, transform_test
 
 
-# --- 修改函数定义以接受 transform_override ---
 def get_dataset(dataset_name, data_path, train=True, img_size=32, download=True, transform_override=None):
-    """Loads the specified dataset."""
+    """加载指定的数据集"""
 
-    # --- 添加逻辑以使用 transform_override ---
     if transform_override:
-        transform = transform_override
-        if train:
-             print("Warning: transform_override provided, ignoring standard training transforms.")
-        else:
-             print("Warning: transform_override provided, ignoring standard testing transforms.")
+        transform_to_use = transform_override
     else:
-        # 原始逻辑：根据 train 参数选择 transform
         transform_train, transform_test = get_transforms(dataset_name, img_size)
-        transform = transform_train if train else transform_test
-    # ------------------------------------
+        transform_to_use = transform_train if train else transform_test
 
     if dataset_name == 'CIFAR10':
+        dataset_class = datasets.CIFAR10
+        dataset_path = os.path.join(data_path, 'CIFAR10')
         print(f"Loading CIFAR10 {'train' if train else 'test'} set...")
-        dataset = datasets.CIFAR10(root=data_path, train=train, download=download, transform=transform)
-        print("CIFAR10 loaded.")
-    elif dataset_name == 'GTSRB':
-        print(f"Loading GTSRB {'train' if train else 'test'} set...")
-        try:
-             # Assumes torchvision >= 0.11
-             dataset = datasets.GTSRB(root=data_path, split='train' if train else 'test', download=download, transform=transform)
-             print("GTSRB loaded.")
-        except AttributeError:
-             print("ERROR: torchvision.datasets.GTSRB not found or requires manual setup.")
-             raise # Stop execution if GTSRB selected but not available
-    elif dataset_name == 'ImageNetSub':
-        split = 'train' if train else 'val'
-        dataset_dir = os.path.join(data_path, 'imagenet_sub', split)
-        print(f"Loading ImageNet subset from: {dataset_dir}")
-        if not os.path.exists(dataset_dir):
-             raise FileNotFoundError(f"ImageNet subset not found at {dataset_dir}. Please organize it.")
-        dataset = datasets.ImageFolder(root=dataset_dir, transform=transform)
-        print("ImageNet subset loaded.")
     else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
+        raise ValueError(f"Dataset {dataset_name} not supported by get_dataset.")
+
+    try:
+        dataset = dataset_class(root=dataset_path, train=train, download=download, transform=transform_to_use)
+        if train:
+            print(f"CIFAR10 train loaded. Found {len(dataset)} samples.")
+        else:
+            print(f"CIFAR10 test loaded. Found {len(dataset)} samples.")
+    except Exception as e:
+        print(f"Error loading {dataset_name}: {e}")
+        if download:
+            print("Please check network connection or data path permissions.")
+        return None
 
     return dataset
 
-# --- PoisonedDataset Class (MODIFIED CHECK) ---
-class PoisonedDataset(torch.utils.data.Dataset):
-    """ A wrapper dataset to apply poisoning on the fly or use pre-poisoned data """
-    def __init__(self, clean_dataset, attacker=None, poison_indices=None, target_label=0, mode='train'):
-        self.clean_dataset = clean_dataset
-        self.attacker = attacker # NFSBA_Attack instance or 'eval' string
-        self.poison_indices = set(poison_indices) if poison_indices is not None else set()
+
+# --- 新的、更健壮的 PoisonedDataset 类 ---
+class PoisonedDataset(Dataset):
+    """
+    一个包装器数据集，用于按需应用后门触发器。
+    它负责处理反归一化、调用攻击器、重新归一化以及标签修改。
+    """
+
+    def __init__(self, base_dataset, attacker, poison_indices_set, target_label, mode='train'):
+        """
+        Args:
+            base_dataset (Dataset): 原始的、已归一化的数据集。
+            attacker (NFSBA_Attack): 已初始化的攻击器实例。
+            poison_indices_set (set): 一个包含应被毒化样本索引的集合。
+            target_label (int): 攻击的目标标签。
+            mode (str):
+                'train': 应用触发器并**修改标签**为 target_label。
+                'test_clean': 不应用触发器，返回原始图像和标签 (用于 BA)。
+                'test_attack': 应用触发器并**返回原始标签** (用于 ASR)。
+        """
+        self.base_dataset = base_dataset
+        self.attacker = attacker
+        self.poison_indices_set = poison_indices_set
         self.target_label = target_label
-        self.mode = mode # 'train', 'test_poison', 'test_attack', 'test_clean'
+        self.mode = mode
 
-        # ** MODIFIED CHECK: Use hasattr instead of isinstance **
-        self.can_poison = (attacker is not None and attacker != 'eval' and
-                           hasattr(attacker, 'generate_poison_batch') and
-                           callable(attacker.generate_poison_batch))
+        # 假设基础数据集使用了 CIFAR10 统计数据
+        # 我们需要反向操作它们
+        self.mean = CIFAR10_MEAN.squeeze(0)  # (3, 1, 1)
+        self.std = CIFAR10_STD.squeeze(0)  # (3, 1, 1)
 
-        if self.mode == 'train' and not self.poison_indices and len(clean_dataset)>0:
-             print("Warning: PoisonedDataset created in 'train' mode with no poison indices.")
-        if not self.can_poison and self.poison_indices:
-             print("Warning: PoisonedDataset has poison indices but attacker is invalid or missing 'generate_poison_batch' method. Will return clean data.")
-
+        if self.attacker is not None:
+            self.device = self.attacker.device  # 从攻击器获取设备
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def __len__(self):
-        return len(self.clean_dataset)
+        return len(self.base_dataset)
 
     def __getitem__(self, index):
-        img, label = self.clean_dataset[index]
+        # 1. 从基础数据集获取（已归一化）的图像和原始标签
+        img_normalized, label = self.base_dataset[index]
 
-        is_poison_target = index in self.poison_indices
+        # 检查是否应该毒化
+        should_poison = (index in self.poison_indices_set) and (self.mode in ['train', 'test_attack'])
 
-        # Use the pre-computed check from __init__
-        if is_poison_target and self.can_poison:
-            # Generate poisoned image on the fly
-            img_clean_batch = img.unsqueeze(0) # Attacker expects batch dimension
-            target_tensor = torch.tensor([self.target_label], dtype=torch.long)
-            # Ensure generation uses the attacker's device and doesn't affect training grads
+        if should_poison:
+            # 2. 反归一化: (img_norm * std) + mean -> [0, 1]
+            # 确保 mean/std 与 img_normalized 在同一设备或类型上（通常是 CPU 上的 tensor）
+            img_0_1 = img_normalized.clone() * self.std + self.mean
+            img_0_1 = torch.clamp(img_0_1, 0.0, 1.0)
+
+            # 3. 应用触发器 (攻击器在 GPU 上运行)
+            # 添加 batch 维度 (1, C, H, W) 并移到攻击器设备
+            img_0_1_batch = img_0_1.unsqueeze(0).to(self.device)
+            target_tensor_batch = torch.tensor([self.target_label], dtype=torch.long).to(self.device)
+
             with torch.no_grad():
-                # ** Maybe add autocast(enabled=False) if AMP causes issues here **
-                # with torch.cuda.amp.autocast(enabled=False):
-                poisoned_img = self.attacker.generate_poison_batch(
-                    img_clean_batch.to(self.attacker.device),
-                    target_tensor.to(self.attacker.device)
-                ).squeeze(0).cpu() # Return result to CPU
+                poisoned_img_0_1_batch = self.attacker.generate_poison_batch(img_0_1_batch, target_tensor_batch)
 
-            if self.mode == 'train' or self.mode == 'test_attack':
-                label = self.target_label # Change label for training or attack testing
-            # If mode is 'test_poison', keep original label (label var already holds it)
+            # 移除 batch 维度并移回 CPU
+            poisoned_img_0_1 = poisoned_img_0_1_batch.squeeze(0).cpu()
 
-            return poisoned_img, label
+            # 4. 重新归一化: (img_poisoned - mean) / std
+            poisoned_img_normalized = (poisoned_img_0_1 - self.mean) / self.std
+
+            # 5. 根据模式返回
+            if self.mode == 'train':
+                # 训练模式：返回毒化图像和*目标标签*
+                return poisoned_img_normalized, self.target_label
+            else:  # 'test_attack'
+                # ASR 测试模式：返回毒化图像和*原始标签*
+                return poisoned_img_normalized, label
+
         else:
-            # Return clean data if not a poison target, attacker is 'eval', or invalid attacker
-            return img, label
+            # 'test_clean' 模式或未被选中的索引
+            # 返回原始图像和原始标签
+            return img_normalized, label

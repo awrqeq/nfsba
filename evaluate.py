@@ -2,7 +2,7 @@
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 import numpy as np
 import random
 import os
@@ -10,18 +10,20 @@ import argparse
 from tqdm import tqdm
 import time
 import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP  # 导入 DDP
 
+# --- 项目导入 ---
 from utils.config import load_config
 from utils.distributed import setup_ddp, cleanup_ddp, is_main_process, reduce_tensor, barrier
+# --- 修改：导入新的 PoisonedDataset ---
 from data.datasets import get_dataset, PoisonedDataset
 from models.victim import load_victim_model
-# --- 修改：同时导入两种 Generator ---
 from models.generator import MLPGenerator, CNNGenerator
 from attacks.nfsba import NFSBA_Attack
-from constants import CIFAR10_MEAN, CIFAR10_STD  # 假设需要反标准化（如果PoisonedDataset需要）
+from constants import CIFAR10_MEAN, CIFAR10_STD
 
 
-# --- 假设 set_seed 函数在这里或者可以从 utils 导入 ---
+# --- Set Seed Function ---
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -32,92 +34,49 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-# --- 假设 calculate_asr_ba_eval 函数在这里定义或从 utils.metrics 导入 ---
-# (这里我们先假设一个简单的评估函数，如果它在别处，请确保导入)
-@torch.no_grad()
-def calculate_asr_ba_eval(model, ba_loader, asr_loader, target_label, device):
-    model.eval()
-    correct_clean = 0
-    total_clean = 0
-    correct_poison = 0
-    total_poison = 0
-
-    # BA
-    for images, labels in tqdm(ba_loader, desc="Evaluating BA",
-                               disable=not is_main_process(dist.get_rank() if dist.is_initialized() else 0)):
-        images, labels = images.to(device), labels.to(device)
-        outputs = model(images)
-        _, predicted = torch.max(outputs.data, 1)
-        total_clean += labels.size(0)
-        correct_clean += (predicted == labels).sum().item()
-
-    # ASR
-    for images, _ in tqdm(asr_loader, desc="Evaluating ASR",
-                          disable=not is_main_process(dist.get_rank() if dist.is_initialized() else 0)):
-        images = images.to(device)
-        targets = torch.full_like(images[:, 0, 0, 0], fill_value=target_label, dtype=torch.long,
-                                  device=device)  # 动态创建目标
-        outputs = model(images)
-        _, predicted = torch.max(outputs.data, 1)
-        total_poison += targets.size(0)
-        correct_poison += (predicted == target_label).sum().item()
-
-    ba = 100 * correct_clean / total_clean if total_clean > 0 else 0
-    asr = 100 * correct_poison / total_poison if total_poison > 0 else 0
-    return ba, asr
-
-
-# -----------------------------------------------------------
-
-
-def main(cfg):
-    # --- DDP 设置 (评估脚本通常用单卡，但如果 launch.sh 用 DDP 启动它，则需要) ---
-    is_ddp = dist.is_available() and dist.is_initialized()
-    rank = dist.get_rank() if is_ddp else 0
-    world_size = dist.get_world_size() if is_ddp else 1
+def main(cfg, rank, world_size, is_ddp):
+    """主评估函数，现在接收 DDP 参数"""
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-
     if rank == 0: print(f"Evaluation using device: {device}")
     set_seed(cfg.seed + rank)
 
     # --- 1. 加载生成器 (用于创建 ASR 测试集) ---
     if rank == 0: print("Loading generator...")
     gen_ckpt_path_to_load = None
-
-    # (使用与 train_victim.py 相同的健壮加载逻辑)
-    gen_ckpt_path_config = cfg.generator.checkpoint_path
-    ckpt_dir = os.path.dirname(gen_ckpt_path_config)
-    base_ckpt_name = os.path.splitext(os.path.basename(gen_ckpt_path_config))[0]
-
-    # 优先加载 _best.pt (因为它被 victim 训练使用)
-    best_gen_ckpt_path = os.path.join(ckpt_dir, f"{base_ckpt_name}_best.pt")
-    last_gen_ckpt_path = os.path.join(ckpt_dir, f"{base_ckpt_name}_last.pt")
-
-    if os.path.exists(best_gen_ckpt_path):
-        gen_ckpt_path_to_load = best_gen_ckpt_path
-        if rank == 0: print(f"Using best generator checkpoint: {gen_ckpt_path_to_load}")
-    elif os.path.exists(last_gen_ckpt_path):
-        gen_ckpt_path_to_load = last_gen_ckpt_path
-        if rank == 0: print(
-            f"Warning: Best generator checkpoint not found. Using last generator checkpoint: {gen_ckpt_path_to_load}")
-    else:
-        if rank == 0: print(
-            f"Error: No generator checkpoint (_best or _last) found at paths derived from {cfg.generator.checkpoint_path}. Cannot create ASR test set.")
-        if is_ddp: cleanup_ddp()
-        return
-
-    # --- !!! 关键修复：根据 cfg.generator.type 实例化 !!! ---
-    generator_type = getattr(cfg.generator, 'type', 'MLP').upper()
-    if rank == 0: print(f"Loading generator type: {generator_type}")
+    generator_model = None
 
     try:
+        gen_ckpt_path_config = cfg.generator.checkpoint_path
+        ckpt_dir = os.path.dirname(gen_ckpt_path_config)
+        base_ckpt_name = os.path.splitext(os.path.basename(gen_ckpt_path_config))[0]
+
+        # 优先加载 _best.pt (因为它被 victim 训练使用)
+        best_gen_ckpt_path = os.path.join(ckpt_dir, f"{base_ckpt_name}_best.pt")
+        last_gen_ckpt_path = os.path.join(ckpt_dir, f"{base_ckpt_name}_last.pt")
+
+        if os.path.exists(best_gen_ckpt_path):
+            gen_ckpt_path_to_load = best_gen_ckpt_path
+        elif os.path.exists(last_gen_ckpt_path):
+            gen_ckpt_path_to_load = last_gen_ckpt_path
+            if rank == 0: print(
+                f"Warning: Best generator checkpoint not found. Using last generator checkpoint: {last_gen_ckpt_path}")
+        else:
+            if rank == 0: print(
+                f"Error: No generator checkpoint (_best or _last) found at paths derived from {cfg.generator.checkpoint_path}. Cannot create ASR test set.")
+            if is_ddp: cleanup_ddp()
+            return
+
+        # --- 根据 cfg.generator.type 实例化 ---
+        generator_type = getattr(cfg.generator, 'type', 'MLP').upper()
+        if rank == 0: print(f"Loading generator type: {generator_type}")
+
         if generator_type == "MLP":
             if not hasattr(cfg.generator, 'hidden_dims'):
                 raise AttributeError("Config missing 'generator.hidden_dims' required for MLPGenerator.")
             ac_dim = cfg.dct_block_size ** 2 - 1
             generator_model = MLPGenerator(ac_dim=ac_dim,
                                            condition_dim=cfg.condition_dim,
-                                           hidden_dims=cfg.generator.hidden_dims,  # <-- 修复点
+                                           hidden_dims=cfg.generator.hidden_dims,
                                            initial_scale=getattr(cfg.generator, 'initial_scale', 0.1),
                                            learnable_scale=getattr(cfg.generator, 'learnable_scale', False)
                                            ).to(device)
@@ -136,15 +95,13 @@ def main(cfg):
                                                                           dict) and 'model_state_dict' in checkpoint_gen else checkpoint_gen
         if "module." in list(state_dict_gen.keys())[0]:
             state_dict_gen = {k.replace("module.", ""): v for k, v in state_dict_gen.items()}
-        generator_model.load_state_dict(state_dict_gen, strict=False)  # strict=False 增加兼容性
+        generator_model.load_state_dict(state_dict_gen, strict=False)
         if rank == 0: print(f"Generator weights loaded from {gen_ckpt_path_to_load}")
 
     except Exception as e:
         if rank == 0: print(f"Error loading generator model: {e}")
         if is_ddp: cleanup_ddp()
         return
-    # -----------------------------------------------------
-
     generator_model.eval()
 
     # --- 2. 初始化攻击器 ---
@@ -166,23 +123,21 @@ def main(cfg):
 
     # --- 3. 加载训练好的受害者模型 ---
     if rank == 0: print("Loading victim model...")
-    victim_model = load_victim_model(cfg.victim_model.name, cfg.num_classes, pretrained=False).to(device)  # 不使用预训练权重
+    victim_model = load_victim_model(cfg.victim_model.name, cfg.num_classes, pretrained=False).to(device)
 
-    # 加载我们自己训练的受害者检查点
     vic_ckpt_path_config = cfg.victim_model.checkpoint_path
     vic_ckpt_dir = os.path.dirname(vic_ckpt_path_config)
     vic_base_name = os.path.splitext(os.path.basename(vic_ckpt_path_config))[0]
 
-    # 优先加载 _best.pt
     best_vic_ckpt_path = os.path.join(vic_ckpt_dir, f"{vic_base_name}_best.pt")
     last_vic_ckpt_path = os.path.join(vic_ckpt_dir, f"{vic_base_name}_last.pt")
 
     victim_ckpt_path_to_load = None
-    if os.path.exists(best_vic_ckpt_path):
+    if os.path.exists(best_vic_ckpt_path):  # 优先加载 best
         victim_ckpt_path_to_load = best_vic_ckpt_path
-    elif os.path.exists(last_vic_ckpt_path):
+    elif os.path.exists(last_vic_ckpt_path):  # 其次加载 last
         victim_ckpt_path_to_load = last_vic_ckpt_path
-    elif os.path.exists(vic_ckpt_path_config):
+    elif os.path.exists(vic_ckpt_path_config):  # 最后尝试配置文件路径
         victim_ckpt_path_to_load = vic_ckpt_path_config
     else:
         if rank == 0: print(
@@ -198,26 +153,35 @@ def main(cfg):
     if "module." in list(state_dict_vic.keys())[0]:
         state_dict_vic = {k.replace("module.", ""): v for k, v in state_dict_vic.items()}
 
-    victim_model.load_state_dict(state_dict_vic, strict=False)  # strict=False
+    victim_model.load_state_dict(state_dict_vic, strict=False)
     if rank == 0: print(f"Victim model weights loaded from {victim_ckpt_path_to_load}")
 
-    # 如果是 DDP 模式，包装模型
     if is_ddp:
         victim_model = DDP(victim_model, device_ids=[rank], output_device=rank)
-        # 注意：Attacker 的 generator 已经是单个 GPU 上的模型，不需要 DDP 包装
 
     victim_model.eval()
 
-    # --- 4. 加载评估数据 ---
+    # --- 4. 加载评估数据 (!!! 关键修改部分 !!!) ---
     if rank == 0: print("Loading evaluation data...")
     test_dataset_clean = get_dataset(cfg.dataset, cfg.data_path, train=False, img_size=cfg.img_size)
 
-    # 创建用于 BA 和 ASR 的 PoisonedDataset 实例
+    # --- BA 评估集 (全干净) ---
     test_dataset_clean_for_ba = PoisonedDataset(test_dataset_clean, attacker, set(), cfg.target_label,
                                                 mode='test_clean')
-    test_poison_indices_asr = set(range(len(test_dataset_clean)))
-    test_dataset_poison_for_asr = PoisonedDataset(test_dataset_clean, attacker, test_poison_indices_asr,
-                                                  cfg.target_label, mode='test_attack')
+
+    # --- ASR 评估集 (仅非目标类, 且全部毒化) ---
+    target_label = cfg.target_label
+    non_target_test_indices = [
+        i for i, (_, label) in enumerate(test_dataset_clean) if label != target_label
+    ]
+    test_subset_non_target = Subset(test_dataset_clean, non_target_test_indices)
+    asr_poison_indices_set = set(range(len(test_subset_non_target)))  # 毒化子集中的所有
+    test_dataset_poison_for_asr = PoisonedDataset(test_subset_non_target, attacker, asr_poison_indices_set,
+                                                  target_label, mode='test_attack')
+
+    if rank == 0:
+        print(f"BA test set size: {len(test_dataset_clean_for_ba)}")
+        print(f"ASR test set size (non-target): {len(test_dataset_poison_for_asr)}")
 
     # DDP Samplers 和 Loaders
     test_ba_sampler = DistributedSampler(test_dataset_clean_for_ba, num_replicas=world_size, rank=rank,
@@ -227,23 +191,15 @@ def main(cfg):
 
     val_batch_size = cfg.batch_size * 2
     test_ba_loader = DataLoader(test_dataset_clean_for_ba, batch_size=val_batch_size,
-                                sampler=test_ba_sampler, shuffle=(test_ba_sampler is None),
+                                sampler=test_ba_sampler, shuffle=False,  # 评估时不需要 shuffle
                                 num_workers=cfg.num_workers, pin_memory=True)
     test_asr_loader = DataLoader(test_dataset_poison_for_asr, batch_size=val_batch_size,
-                                 sampler=test_asr_sampler, shuffle=(test_asr_sampler is None),
+                                 sampler=test_asr_sampler, shuffle=False,
                                  num_workers=cfg.num_workers, pin_memory=True)
 
     # --- 5. 执行评估 ---
     if rank == 0: print("Starting final evaluation...")
 
-    # 在 DDP 模式下，评估函数需要处理聚合；在单卡模式下，直接计算
-    # 为简单起见，我们让 calculate_asr_ba_eval 处理 DDP 聚合（如果它在内部执行）
-    # 或者，我们在这里收集结果
-
-    # 暂时使用简化的单卡评估逻辑（因为 DDP 启动脚本似乎只在 rank 0 打印最终结果）
-    # 注意：如果 launch_ddp.sh 用 DDP 启动 evaluate.py，这里的评估逻辑也需要是分布式的
-
-    # --- 采用与 train_victim 类似的分布式评估逻辑 ---
     correct_clean_local = 0
     total_clean_local = 0
     correct_poison_local = 0
@@ -252,7 +208,7 @@ def main(cfg):
     with torch.no_grad():
         ba_pbar = tqdm(test_ba_loader, desc="Final BA Eval", disable=(rank != 0))
         for images, labels in ba_pbar:
-            images, labels = images.to(device), labels.to(device)
+            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             outputs = victim_model(images)
             _, predicted = torch.max(outputs.data, 1)
             total_clean_local += labels.size(0)
@@ -260,9 +216,10 @@ def main(cfg):
 
         asr_pbar = tqdm(test_asr_loader, desc="Final ASR Eval", disable=(rank != 0))
         target_labels_template = torch.full((val_batch_size,), cfg.target_label, dtype=torch.long, device=device)
-        for images, _ in asr_pbar:
-            images = images.to(device)
+        for images, _ in asr_pbar:  # 忽略 ASR loader 返回的原始标签
+            images = images.to(device, non_blocking=True)
             current_batch_size = images.size(0)
+
             if target_labels_template.size(0) != current_batch_size:
                 current_target_labels = target_labels_template[:current_batch_size]
             else:
@@ -271,9 +228,10 @@ def main(cfg):
             outputs = victim_model(images)
             _, predicted = torch.max(outputs.data, 1)
             total_poison_local += images.size(0)
+            # ASR 是指成功预测为目标标签
             correct_poison_local += (predicted == cfg.target_label).sum().item()
 
-    # 聚合 DDP 结果
+    # --- 聚合 DDP 结果 ---
     val_results_local = torch.tensor(
         [correct_clean_local, total_clean_local,
          correct_poison_local, total_poison_local],
@@ -283,7 +241,7 @@ def main(cfg):
     if is_ddp:
         dist.all_reduce(val_results_local, op=dist.ReduceOp.SUM)
 
-    # 在 Rank 0 上计算并打印最终结果
+    # --- 在 Rank 0 上计算并打印最终结果 ---
     if rank == 0:
         reduced_correct_clean = val_results_local[0].item()
         reduced_total_clean = val_results_local[1].item()
@@ -306,38 +264,46 @@ def main(cfg):
 
 
 if __name__ == "__main__":
-    # --- 设置多进程启动方法 ---
     try:
         mp.set_start_method('spawn', force=True)
-        print("Multiprocessing start method set to 'spawn'.")
+        if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+            print("Multiprocessing start method set to 'spawn'.")
     except RuntimeError as e:
-        print(f"Warning: Could not set multiprocessing start method to 'spawn': {e}")
-    # --------------------------
+        if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+            print(f"Warning: Could not set multiprocessing start method to 'spawn': {e}")
 
     parser = argparse.ArgumentParser(description='Evaluate NFSBA Victim Model')
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
 
     args = parser.parse_args()
-    cfg = load_config(args.config)
+
+    try:
+        cfg = load_config(args.config)
+    except FileNotFoundError:
+        print(f"Error: Config file not found at {args.config}")
+        exit()
+    except Exception as e:
+        print(f"Error loading config file {args.config}: {e}")
+        exit()
 
     # --- DDP 环境变量 (由 launch.sh 设置) ---
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
-    # 检查是否 DDP 启动
     is_ddp = world_size > 1
     if is_ddp:
         try:
             setup_ddp(local_rank, world_size, cfg.master_port)
-            print(f"DDP Setup: Rank {local_rank}/{world_size} on GPU {local_rank}")
+            if local_rank == 0: print(f"DDP Setup complete for {world_size} processes.")
         except Exception as e:
             print(f"Rank {local_rank}: DDP Setup failed: {e}")
-            exit()  # DDP 失败时退出
+            exit()
     else:
         print("Running in single-process mode (no DDP).")
 
     try:
-        main(cfg)  # main 函数现在从 cfg 获取所有信息
+        # 将 DDP 参数传递给 main
+        main(cfg, local_rank, world_size, is_ddp)
     except Exception as e:
         print(f"Rank {local_rank}: An error occurred during evaluation: {e}")
         import traceback

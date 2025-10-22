@@ -20,7 +20,7 @@ proxy_training:
 
 # Attack Config
 attack: NFSBA
-poison_rate: 0.01
+poison_rate: 0.05
 target_label: 0
 dct_block_size: 8
 condition_type: embedding
@@ -35,13 +35,13 @@ generator:
   epochs: 50
   checkpoint_path: ./checkpoints/generator_cifar10_cnn_lpips.pt # <-- 新路径
   # === 损失权重 ===
-  lambda_stat_dist: [1.0, 1.0]   # 保持统计损失
-  lambda_stat_energy: [1.0, 1.0] # 保持统计损失
-  lambda_trigger: [0.0001, 0.0001]     # 保持触发器权重
-  lambda_perturb: [1.0, 10.0]     # Lpert 设为 0，依靠 LPIPS
-  lambda_lpips: [2.0, 10.0]       # 启用 LPIPS 损失
+  lambda_stat_dist: [0.5, 1.0]   # 保持统计损失
+  lambda_stat_energy: [0.5, 1.0] # 保持统计损失
+  lambda_trigger: [0.005, 0.001]     # 保持触发器权重
+  lambda_perturb: [1.0, 5.0]     # Lpert 设为 0，依靠 LPIPS
+  lambda_lpips: [1.0, 5.0]       # 启用 LPIPS 损失
   # ==================
-  phase1_epochs_ratio: 0.4
+  phase1_epochs_ratio: 0.8
   resume_generator: False
   # --- 控制 Tanh 后的缩放因子 ---
   initial_scale: 0.1 # 保持 0.2
